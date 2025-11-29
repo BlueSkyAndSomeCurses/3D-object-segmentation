@@ -1,0 +1,1 @@
+One can find source video, frames extracted from video, 2D segmentation masks and 3D colmap reconstruction [under this link](https://github.com/BlueSkyAndSomeCurses/3D-object-segmentation.git)
