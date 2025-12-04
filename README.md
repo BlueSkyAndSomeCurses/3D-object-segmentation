@@ -1,6 +1,6 @@
 ## Project Notes
 
-One can find the source video, extracted frames, SAM2 masks, and COLMAP reconstructions [under this link](https://github.com/BlueSkyAndSomeCurses/3D-object-segmentation.git).
+One can find the source video, extracted frames, SAM2 masks, and COLMAP reconstructions [under this link](https://drive.google.com/drive/folders/1fe27d71lrdMEif8RSsaaTU1_XB1Gm91N?usp=sharing).
 
 ## Why This Object?
 
