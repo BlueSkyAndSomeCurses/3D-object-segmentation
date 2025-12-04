@@ -24,12 +24,14 @@ def _():
 
     from tqdm import tqdm
     import json
+    import marimo as mo
     return (
         Optional,
         Path,
         cv2,
         defaultdict,
         json,
+        mo,
         np,
         o3d,
         pl,
@@ -135,6 +137,7 @@ def _(Path, frames, save_frames):
 
 @app.cell
 def _(Path, images_path, pycolmap):
+    Path("./reconstruction").mkdir(parents=True, exist_ok=True)
     database_path = Path("./reconstruction") / "database.db"
     pycolmap.extract_features(database_path = database_path, image_path = images_path / "png_frames")
     return (database_path,)
@@ -312,7 +315,6 @@ def _(cv2, draw_masks_on_image, plt):
             plt.axis('off')
             plt.tight_layout()
             plt.show()
-
     return (visualize_image_with_masks,)
 
 
@@ -388,8 +390,7 @@ def _(mo, np, o3d, pl, px):
         fig.update_layout(scene=dict(aspectmode='data')) 
 
         return mo.ui.plotly(fig)
-        
-        
+
     return (draw_3d_model,)
 
 
@@ -463,29 +464,31 @@ def _(
                 masks_data['image_size']['height'],
                 masks_data['image_size']['width']
             )
-        
+
             for point2D in image.points2D:
                 if point2D.has_point3D():
                     x, y = point2D.xy
                     x, y = int(round(x)), int(round(y))
-                    if mask[x,y] == 1:
-                        mask_hit_counts[point2D.point3D_id] += 1
+                    if 0 <= int(round(y)) < mask.shape[0] and \
+                       0 <= int(round(x)) < mask.shape[1]:
+                        if mask[int(round(y)), int(round(x))] == 1:
+                            mask_hit_counts[point2D.point3D_id] += 1
 
         points_to_delete = []
         for point3D_id, point3D in reconstruction.points3D.items():
-        
+
             total_observations = point3D.track.length()
-        
+
             mask_hits = mask_hit_counts[point3D_id]
-        
+
             ratio = mask_hits / total_observations if total_observations > 0 else 0
-        
+
             if total_observations < min_track_length or ratio < min_mask_ratio:
                 points_to_delete.append(point3D_id)
 
         for point3D_id in points_to_delete:
             segmented_reconstruction.delete_point3D(point3D_id)
-                
+
         return segmented_reconstruction
     return (get_segmented_3D_points,)
 
@@ -522,13 +525,85 @@ def _(clean_segmented_reconstruction_o3d, draw_3d_model):
 
 
 @app.cell
-def _():
-    import marimo as mo
-    return (mo,)
+def _(clean_segmented_reconstruction_o3d, np, o3d):
+    def fit_plane_and_clean(
+        pcd: o3d.geometry.PointCloud,
+        clip_percentile: float = 5.0,
+        remove_outliers: bool = True,
+        visualize: bool = False
+    ):
+        pts = np.asarray(pcd.points)
+        if len(pts) < 3:
+            return pcd, o3d.geometry.PointCloud()
+
+        mean, covariance = pcd.compute_mean_and_covariance()
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        primary_axis = eigenvectors[:, -1]
+    
+        projections = np.dot(pts - mean, primary_axis)
+    
+        cut_threshold = 100 - clip_percentile
+        threshold_val = np.percentile(projections, cut_threshold)
+    
+        keep_mask = projections < threshold_val
+        keep_indices = np.where(keep_mask)[0]
+    
+        object_pcd = pcd.select_by_index(keep_indices)
+        removed_table = pcd.select_by_index(keep_indices, invert=True)
+
+        removed_noise = o3d.geometry.PointCloud()
+    
+        if remove_outliers:
+            print("Running Statistical Outlier Removal...")
+            cl, ind = object_pcd.remove_statistical_outlier(nb_neighbors=50, std_ratio=1.5)
+        
+            noise_cloud = object_pcd.select_by_index(ind, invert=True)
+        
+            object_pcd = cl
+            removed_noise = noise_cloud
+
+        all_removed_pcd = removed_table + removed_noise
+
+        print(f"Final Object points: {len(object_pcd.points)}")
+        print(f"Total Removed points: {len(all_removed_pcd.points)}")
+
+        if visualize:
+            object_pcd.paint_uniform_color([0, 0.5, 1])
+            all_removed_pcd.paint_uniform_color([1, 0, 0])
+        
+            line_points = [mean, mean + primary_axis * 0.5] 
+            lines = [[0, 1]]
+            line_set = o3d.geometry.LineSet(
+                points=o3d.utility.Vector3dVector(line_points),
+                lines=o3d.utility.Vector2iVector(lines),
+            )
+            line_set.paint_uniform_color([0, 1, 0])
+        
+            o3d.visualization.draw_geometries([object_pcd, all_removed_pcd, line_set])
+
+        return object_pcd, all_removed_pcd
+
+    object_without_table, debris = fit_plane_and_clean(
+        clean_segmented_reconstruction_o3d, 
+        clip_percentile=5.0, 
+        remove_outliers=True,
+        visualize=False
+    )
+    return (object_without_table,)
 
 
 @app.cell
-def _():
+def _(draw_3d_model, object_without_table):
+    draw_3d_model(object_without_table)
+    # draw_3d_model(debris)
+    return
+
+
+@app.cell
+def _(o3d, object_without_table, reconstruction_path):
+    filtered_model_path = reconstruction_path / "segmented_model_without_table.ply"
+    o3d.io.write_point_cloud(str(filtered_model_path), object_without_table)
+    print(f"Saved table-filtered model to {filtered_model_path}")
     return
 
 
