@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.18.1"
+__generated_with = "0.18.2"
 app = marimo.App()
 
 
@@ -25,7 +25,10 @@ def _():
     from tqdm import tqdm
     import json
     import marimo as mo
+
+    from sklearn.cluster import DBSCAN
     return (
+        DBSCAN,
         Optional,
         Path,
         cv2,
@@ -38,23 +41,8 @@ def _():
         plt,
         px,
         pycolmap,
-        torch,
         tqdm,
     )
-
-
-@app.cell
-def _(np, torch):
-    np.random.seed(42)
-    torch.manual_seed(42)
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    return (device,)
-
-
-@app.cell
-def _(device):
-    print(device)
-    return
 
 
 @app.cell
@@ -382,7 +370,6 @@ def _(mo, np, o3d, pl, px):
             color='color_hex',  
             color_discrete_map="identity", 
             height=600,
-            title="Interactive Open3D Point Cloud in Marimo (via Polars/Plotly)",
             hover_data=['R', 'G', 'B']
         )
 
@@ -390,7 +377,6 @@ def _(mo, np, o3d, pl, px):
         fig.update_layout(scene=dict(aspectmode='data')) 
 
         return mo.ui.plotly(fig)
-
     return (draw_3d_model,)
 
 
@@ -426,10 +412,12 @@ def _(images):
 
 @app.cell
 def _(
+    DBSCAN,
     Path,
     defaultdict,
     images,
     load_sam2_masks,
+    np,
     pixels_to_mask,
     pycolmap,
     tqdm,
@@ -440,6 +428,9 @@ def _(
         masks_dir: Path,
         min_track_length: int = 3,
         min_mask_ratio: float = 0.5,
+        apply_clustering: bool = True,
+        dbscan_eps: float = 0.05,
+        dbscan_min_samples: int = 10,
     ) -> pycolmap.Reconstruction:
 
         reconstruction = pycolmap.Reconstruction(reconstruction_path)
@@ -448,6 +439,7 @@ def _(
         points3D = reconstruction.points3D
         valid_points = set()
         mask_hit_counts = defaultdict(int)
+        background_hit_counts = defaultdict(int)
 
         for image_idx, image in tqdm(images.items(), desc="Processing images"):
 
@@ -489,6 +481,29 @@ def _(
         for point3D_id in points_to_delete:
             segmented_reconstruction.delete_point3D(point3D_id)
 
+        if apply_clustering and len(segmented_reconstruction.points3D) > 0:
+            point_ids = list(segmented_reconstruction.points3D.keys())
+            point_coords = np.array([
+                segmented_reconstruction.points3D[pid].xyz 
+                for pid in point_ids
+            ])
+        
+            clustering = DBSCAN(eps=dbscan_eps, min_samples=dbscan_min_samples)
+            labels = clustering.fit_predict(point_coords)
+        
+            unique_labels, counts = np.unique(labels[labels >= 0], return_counts=True)
+        
+            if len(unique_labels) > 0:
+                largest_cluster_label = unique_labels[np.argmax(counts)]
+            
+                points_to_delete_clustering = [
+                    point_ids[i] for i, label in enumerate(labels) 
+                    if label != largest_cluster_label
+                ]
+            
+                for point3D_id in points_to_delete_clustering:
+                    segmented_reconstruction.delete_point3D(point3D_id)
+
         return segmented_reconstruction
     return (get_segmented_3D_points,)
 
@@ -498,7 +513,10 @@ def _(Path, get_segmented_3D_points, images_path):
     segmented_reconstruction = get_segmented_3D_points(
         reconstruction_path=Path("./reconstruction/0"),
         images_path=images_path,
-        masks_dir=Path("./data/sam2_masks")
+        masks_dir=Path("./data/sam2_masks"),
+        apply_clustering=True,
+        dbscan_eps=0.05,
+        dbscan_min_samples=10
     )
     return (segmented_reconstruction,)
 
@@ -515,7 +533,7 @@ def _(o3d, reconstruction_path):
     segmented_reconstruction_o3d = o3d.io.read_point_cloud(str(reconstruction_path / "segmented_model.ply"))
     cl, ind = segmented_reconstruction_o3d.remove_statistical_outlier(nb_neighbors=50, std_ratio=1.0)
     clean_segmented_reconstruction_o3d = segmented_reconstruction_o3d.select_by_index(ind)
-    return (clean_segmented_reconstruction_o3d,)
+    return clean_segmented_reconstruction_o3d, segmented_reconstruction_o3d
 
 
 @app.cell
@@ -539,38 +557,35 @@ def _(clean_segmented_reconstruction_o3d, np, o3d):
         mean, covariance = pcd.compute_mean_and_covariance()
         eigenvalues, eigenvectors = np.linalg.eigh(covariance)
         primary_axis = eigenvectors[:, -1]
-    
+
         projections = np.dot(pts - mean, primary_axis)
-    
+
         cut_threshold = 100 - clip_percentile
         threshold_val = np.percentile(projections, cut_threshold)
-    
+
         keep_mask = projections < threshold_val
         keep_indices = np.where(keep_mask)[0]
-    
+
         object_pcd = pcd.select_by_index(keep_indices)
         removed_table = pcd.select_by_index(keep_indices, invert=True)
 
         removed_noise = o3d.geometry.PointCloud()
-    
+
         if remove_outliers:
-            print("Running Statistical Outlier Removal...")
             cl, ind = object_pcd.remove_statistical_outlier(nb_neighbors=50, std_ratio=1.5)
-        
+
             noise_cloud = object_pcd.select_by_index(ind, invert=True)
-        
+
             object_pcd = cl
             removed_noise = noise_cloud
 
         all_removed_pcd = removed_table + removed_noise
 
-        print(f"Final Object points: {len(object_pcd.points)}")
-        print(f"Total Removed points: {len(all_removed_pcd.points)}")
 
         if visualize:
             object_pcd.paint_uniform_color([0, 0.5, 1])
             all_removed_pcd.paint_uniform_color([1, 0, 0])
-        
+
             line_points = [mean, mean + primary_axis * 0.5] 
             lines = [[0, 1]]
             line_set = o3d.geometry.LineSet(
@@ -578,7 +593,7 @@ def _(clean_segmented_reconstruction_o3d, np, o3d):
                 lines=o3d.utility.Vector2iVector(lines),
             )
             line_set.paint_uniform_color([0, 1, 0])
-        
+
             o3d.visualization.draw_geometries([object_pcd, all_removed_pcd, line_set])
 
         return object_pcd, all_removed_pcd
@@ -603,7 +618,50 @@ def _(draw_3d_model, object_without_table):
 def _(o3d, object_without_table, reconstruction_path):
     filtered_model_path = reconstruction_path / "segmented_model_without_table.ply"
     o3d.io.write_point_cloud(str(filtered_model_path), object_without_table)
-    print(f"Saved table-filtered model to {filtered_model_path}")
+    return
+
+
+@app.cell
+def _(o3d):
+    def fit_ransac_plane(pcd: o3d.geometry.PointCloud,
+                         distance_threshold: float = 0.01,
+                         ransac_n: int = 3,
+                         num_iterations: int = 1000):
+        plane_model, inliers = pcd.segment_plane(distance_threshold=distance_threshold,
+                                                 ransac_n=ransac_n,
+                                                 num_iterations=num_iterations)
+        [a, b, c, d] = plane_model
+
+        plane_cloud = pcd.select_by_index(inliers)
+        non_plane_cloud = pcd.select_by_index(inliers, invert=True)
+
+        return plane_model, plane_cloud, non_plane_cloud
+    return (fit_ransac_plane,)
+
+
+@app.cell
+def _(fit_ransac_plane, segmented_reconstruction_o3d):
+    plane_model, plane_cloud, non_plane_cloud = fit_ransac_plane(segmented_reconstruction_o3d)
+    return (non_plane_cloud,)
+
+
+@app.cell
+def _(non_plane_cloud, o3d):
+    o3d.io.write_point_cloud("./reconstruction/segmented_model_wo_plane_RANSAC.ply", non_plane_cloud)
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    RANSAC plane fitting works bad, as points remaining from the background are on different levels.
+    """)
+    return
+
+
+@app.cell
+def _(draw_3d_model, non_plane_cloud):
+    draw_3d_model(non_plane_cloud)
     return
 
 
